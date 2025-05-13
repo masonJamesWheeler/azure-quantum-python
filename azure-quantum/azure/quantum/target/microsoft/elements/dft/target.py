@@ -62,7 +62,12 @@ class MicrosoftElementsDft(Target):
         """
         Submit DFT job to Azure Quantum Services.
         
-        :param input_data: Input data
+        :param input_data: Input data. Can be:
+                           - An XYZ string
+                           - A file path to an XYZ or QCSchema file
+                           - A list of file paths to XYZ or QCSchema files
+                           - A list of QCSchema dictionaries
+                           - A list of XYZ strings
         :type input_data: Any
         :param name: Job name
         :type name: str
@@ -76,27 +81,96 @@ class MicrosoftElementsDft(Target):
 
         if shots is not None:
             warnings.warn("The 'shots' parameter is ignored in Microsoft Elements Dft job.")
+            
+        # Helper function to detect if a string is likely XYZ content
+        def is_xyz_content(s):
+            try:
+                # XYZ files shouldn't look like JSON
+                if '{' in s or '}' in s:
+                    return False
+                    
+                lines = s.strip().split('\n')
+                if len(lines) < 3:
+                    return False
+                    
+                # Try to parse first line as an integer (number of atoms)
+                num_atoms = int(lines[0].strip())
+                
+                # Check if we have at least as many atom lines as expected
+                content_lines = [line for line in lines[2:] if line.strip()]
+                if len(content_lines) < num_atoms:
+                    return False
+                
+                return True
+            except (ValueError, AttributeError):
+                return False
         
         if isinstance(input_data, list):
-
+            # Handle list input (files or QCSchema objects)
             if len(input_data) < 1:
                 raise ValueError("Input data list has no elements.")
 
-            if all(isinstance(task,str) for task in input_data):
-                qcschema_data = self.assemble_qcschema_from_files(input_data, input_params)
-            
+            if all(isinstance(task, str) for task in input_data):
+                # First check if all items look like XYZ content
+                all_xyz_content = all(is_xyz_content(item) for item in input_data)
+                
+                # Or check if any items are XYZ content but don't exist as files
+                any_xyz_not_file = any(is_xyz_content(item) and not Path(item).exists() for item in input_data)
+                
+                if all_xyz_content or any_xyz_not_file:
+                    # List contains XYZ strings, not file paths
+                    # Convert each XYZ string to QCSchema
+                    qcschema_data = []
+                    for i, xyz_content in enumerate(input_data):
+                        try:
+                            mol = self._xyz_to_qcschema_mol(xyz_content)
+                            qcschema = self._new_qcshema(input_params or {}, mol)
+                            qcschema_data.append(qcschema)
+                        except ValueError as e:
+                            # Provide more detailed error for specific item
+                            raise ValueError(f"Error processing XYZ content at index {i}: {str(e)}. Please check the format of your XYZ data.") from e
+                    
+                    # Create blobs for each QCSchema
+                    qcschema_blobs = {}
+                    for i in range(len(qcschema_data)):
+                        qcschema_blobs[f"inputData_{i}"] = self._encode_input_data(qcschema_data[i])
+                    
+                    # Use placeholder file names for table of contents
+                    placeholder_names = [f"content_{i}.xyz" for i in range(len(input_data))]
+                    toc_str = self._create_table_of_contents(placeholder_names, list(qcschema_blobs.keys()))
+                else:
+                    # List of file paths
+                    try:
+                        qcschema_data = self.assemble_qcschema_from_files(input_data, input_params)
+                    except FileNotFoundError as e:
+                        raise ValueError(f"File not found error: {str(e)}. Please ensure all file paths are correct.") from e
+                    except ValueError as e:
+                        raise ValueError(f"Error processing input files: {str(e)}. Please check your file formats and ensure they are valid XYZ or QCSchema files.") from e
+                
+                    qcschema_blobs = {}
+                    for i in range(len(qcschema_data)):
+                        qcschema_blobs[f"inputData_{i}"] = self._encode_input_data(qcschema_data[i])
+                
+                    toc_str = self._create_table_of_contents(input_data, list(qcschema_blobs.keys()))
+            elif all(isinstance(task, dict) for task in input_data): 
+                # List of QCSchema dictionaries
                 qcschema_blobs = {}
-                for i in range(len(qcschema_data)):
-                    qcschema_blobs[f"inputData_{i}"] = self._encode_input_data(qcschema_data[i])
-            
-                toc_str = self._create_table_of_contents(input_data, list(qcschema_blobs.keys()))
-            elif all(isinstance(task,dict) for task in input_data): 
-                qcschema_blobs = {}
-                for i in range(len(input_data)):
-                    qcschema_blobs[f"inputData_{i}"] = self._encode_input_data(input_data[i])
-                toc_str = '{"description": "QcSchema Objects were given for input."}'
+                try:
+                    for i in range(len(input_data)):
+                        qcschema_blobs[f"inputData_{i}"] = self._encode_input_data(input_data[i])
+                    toc_str = '{"description": "QcSchema Objects were given for input."}'
+                except Exception as e:
+                    raise ValueError(f"Error processing QCSchema dictionary at index {i}: {str(e)}. Please ensure all dictionaries are valid QCSchema objects.") from e
             else:
-                raise ValueError(f"Unsupported batch submission. Please use List[str] or List[dict].")
+                # Check if we have a mix of strings and dictionaries
+                if any(isinstance(task, str) for task in input_data) and any(isinstance(task, dict) for task in input_data):
+                    raise ValueError("Mixed string and dictionary types in input_data list. Please use either all strings (file paths or XYZ content) or all dictionaries (QCSchema objects).")
+                # Get the actual types for better error reporting
+                types = [type(item).__name__ for item in input_data[:3]]
+                if len(input_data) > 3:
+                    types.append("...")
+                raise ValueError(f"Unsupported batch submission with types: {', '.join(types)}. Please use either List[str] for file paths/XYZ content or List[dict] for QCSchema objects.")
+                
             toc = self._encode_input_data(toc_str)
 
             input_params = {} if input_params is None else input_params
@@ -115,14 +189,91 @@ class MicrosoftElementsDft(Target):
                 session_id=self.get_latest_session_id(),
                 **kwargs
             )
+        elif isinstance(input_data, str):
+            # Handle string input (file path or XYZ content)
+            file_path = Path(input_data)
+            
+            # Check if this is XYZ content or a file path
+            if is_xyz_content(input_data) and not file_path.exists():
+                # It's XYZ content - convert to QCSchema
+                try:
+                    mol = self._xyz_to_qcschema_mol(input_data)
+                    qcschema = self._new_qcshema(input_params or {}, mol)
+                    
+                    # Submit as JSON QCSchema
+                    return super().submit(
+                        input_data=qcschema,
+                        name=name, 
+                        shots=shots, 
+                        input_params=input_params,
+                        content_type=ContentType.json,
+                        input_data_format='microsoft.qc-schema.v1',
+                        **kwargs
+                    )
+                except ValueError as e:
+                    raise ValueError(f"Error processing XYZ content: {str(e)}. Please check your XYZ data format.") from e
+            elif file_path.exists():
+                # It's an existing file path
+                if file_path.suffix.lower() == '.xyz':
+                    try:
+                        # For XYZ files, convert to QCSchema first
+                        file_data = file_path.read_text()
+                        mol = self._xyz_to_qcschema_mol(file_data)
+                        qcschema = self._new_qcshema(input_params or {}, mol)
+                        
+                        return super().submit(
+                            input_data=qcschema,
+                            name=name, 
+                            shots=shots, 
+                            input_params=input_params,
+                            content_type=ContentType.json,
+                            input_data_format='microsoft.qc-schema.v1',
+                            **kwargs
+                        )
+                    except ValueError as e:
+                        raise ValueError(f"Error processing XYZ file '{file_path}': {str(e)}. Please check your file format.") from e
+                elif file_path.suffix.lower() == '.json':
+                    try:
+                        # For JSON files, assume they're already in QCSchema format
+                        with open(file_path, 'r') as f:
+                            qcschema = json.load(f)
+                        
+                        return super().submit(
+                            input_data=qcschema,
+                            name=name, 
+                            shots=shots, 
+                            input_params=input_params,
+                            content_type=ContentType.json,
+                            input_data_format='microsoft.qc-schema.v1',
+                            **kwargs
+                        )
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Error decoding JSON file '{file_path}': {str(e)}. Please ensure it's a valid JSON file.") from e
+                    except Exception as e:
+                        raise ValueError(f"Error processing file '{file_path}': {str(e)}") from e
+                else:
+                    # Unknown file extension
+                    raise ValueError(f"Unsupported file type: {file_path.suffix}. Please use .xyz or .json files.")
+            else:
+                # Not recognized as XYZ content and not an existing file
+                raise ValueError(f"Input string '{input_data[:40]}...' (truncated) is neither recognized as XYZ content nor exists as a file. Please provide valid XYZ content or a correct file path.")
+        elif isinstance(input_data, dict):
+            # Handle dictionary input - check if it's a QCSchema
+            if 'schema_name' in input_data and input_data['schema_name'].startswith(('qcschema_', 'madft_')):
+                # It's a QCSchema dictionary - submit it directly with proper content type
+                return super().submit(
+                    input_data=input_data,
+                    name=name, 
+                    shots=shots,
+                    input_params=input_params,
+                    content_type=ContentType.json,
+                    input_data_format='microsoft.qc-schema.v1',
+                    **kwargs
+                )
+            else:
+                raise ValueError(f"Invalid dictionary input: Dictionary does not appear to be a QCSchema (missing 'schema_name' field or incorrect schema type). For DFT jobs, input_data must be a file path, XYZ content, or QCSchema.")
         else:
-            return super().submit(
-                input_data=input_data,
-                name=name, 
-                shots=shots, 
-                input_params=input_params,
-                **kwargs
-            )
+            raise ValueError(f"Invalid input_data type: {type(input_data).__name__}. Expected a file path, XYZ content string, a list of these, or a QCSchema dictionary.")
 
 
     
