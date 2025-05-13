@@ -119,12 +119,17 @@ class MicrosoftElementsDft(Target):
                 
                 if all_xyz_content or any_xyz_not_file:
                     # List contains XYZ strings, not file paths
+                    
+                    # XYZ input requires input_params
+                    if input_params is None:
+                        raise ValueError("XYZ files require input_params dictionary with 'driver' and 'model' fields. Please provide calculation parameters.")
+                    
                     # Convert each XYZ string to QCSchema
                     qcschema_data = []
                     for i, xyz_content in enumerate(input_data):
                         try:
                             mol = self._xyz_to_qcschema_mol(xyz_content)
-                            qcschema = self._new_qcshema(input_params or {}, mol)
+                            qcschema = self._new_qcshema(input_params, mol)
                             qcschema_data.append(qcschema)
                         except ValueError as e:
                             # Provide more detailed error for specific item
@@ -191,6 +196,9 @@ class MicrosoftElementsDft(Target):
             )
         elif isinstance(input_data, str):
             # Handle string input (file path or XYZ content)
+            if not input_data.strip():
+                raise ValueError("Empty input string is not valid.")
+                
             file_path = Path(input_data)
             
             # Check if this is XYZ content or a file path
@@ -214,12 +222,22 @@ class MicrosoftElementsDft(Target):
                     raise ValueError(f"Error processing XYZ content: {str(e)}. Please check your XYZ data format.") from e
             elif file_path.exists():
                 # It's an existing file path
-                if file_path.suffix.lower() == '.xyz':
+                # Determine file type by content
+                file_data = file_path.read_text()
+                
+                # Check if this is XYZ format (first line is a number)
+                lines = file_data.strip().split('\n')
+                is_xyz = len(lines) >= 3 and lines[0].strip().isdigit()
+                
+                if is_xyz or file_path.suffix.lower() == '.xyz':
+                    # XYZ format requires input_params
+                    if input_params is None:
+                        raise ValueError(f"XYZ file '{file_path}' requires input parameters. Please provide input_params.")
+                        
                     try:
                         # For XYZ files, convert to QCSchema first
-                        file_data = file_path.read_text()
                         mol = self._xyz_to_qcschema_mol(file_data)
-                        qcschema = self._new_qcshema(input_params or {}, mol)
+                        qcschema = self._new_qcshema(input_params, mol)
                         
                         return super().submit(
                             input_data=qcschema,
@@ -256,7 +274,7 @@ class MicrosoftElementsDft(Target):
                     raise ValueError(f"Unsupported file type: {file_path.suffix}. Please use .xyz or .json files.")
             else:
                 # Not recognized as XYZ content and not an existing file
-                raise ValueError(f"Input string '{input_data[:40]}...' (truncated) is neither recognized as XYZ content nor exists as a file. Please provide valid XYZ content or a correct file path.")
+                raise ValueError(f"Input string '{input_data[:40]}...' (truncated) is not valid input data.")
         elif isinstance(input_data, dict):
             # Handle dictionary input - check if it's a QCSchema
             if 'schema_name' in input_data and input_data['schema_name'].startswith(('qcschema_', 'madft_')):
@@ -271,9 +289,9 @@ class MicrosoftElementsDft(Target):
                     **kwargs
                 )
             else:
-                raise ValueError(f"Invalid dictionary input: Dictionary does not appear to be a QCSchema (missing 'schema_name' field or incorrect schema type). For DFT jobs, input_data must be a file path, XYZ content, or QCSchema.")
+                raise ValueError(f"Invalid dictionary input: Dictionary does not appear to be a QCSchema (missing 'schema_name' field or incorrect schema type).")
         else:
-            raise ValueError(f"Invalid input_data type: {type(input_data).__name__}. Expected a file path, XYZ content string, a list of these, or a QCSchema dictionary.")
+            raise ValueError(f"Invalid input_data type: {type(input_data).__name__}.")
 
 
     
@@ -284,7 +302,7 @@ class MicrosoftElementsDft(Target):
         
         :param input_data: Input data
         :type input_data: List[str]
-        :param input_params: Input parameters
+        :param input_params: Input parameters - required for XYZ files
         :type input_params: Dict[str, Any]
         :rtype: List[Dict]
         """
@@ -294,19 +312,40 @@ class MicrosoftElementsDft(Target):
         qcshema_objects = []
         for file in input_data:
             file_path = Path(file)
-            
             file_data = file_path.read_text()
-            if file_path.suffix == '.xyz':
-                mol = self._xyz_to_qcschema_mol(file_data)
-                new_qcschema = self._new_qcshema( input_params, mol )
-                qcshema_objects.append(new_qcschema)
-            elif file_path.suffix == '.json':
+            
+            # Check if this is JSON by trying to parse it
+            try:
+                # Attempt to parse as JSON
+                json_data = json.loads(file_data)
+                # If we get here, it's JSON
                 if input_params is not None and len(input_params.keys()) > 0:
                     warnings.warn('Input parameters were given along with a QcSchema file which contains parameters, using QcSchema parameters as is.')
-                with open(file_path, 'r') as f:
-                    qcshema_objects.append( json.load(f) )
-            else:
-                raise ValueError(f"File type '{file_path.suffix}' for file '{file_path}' is not supported.")
+                qcshema_objects.append(json_data)
+                continue
+            except json.JSONDecodeError:
+                # Not JSON, continue checking
+                pass
+                
+            # Try to parse as XYZ format
+            try:
+                # Check if the first line is a number (atom count) - key indicator of XYZ format
+                lines = file_data.strip().split('\n')
+                if len(lines) >= 3 and lines[0].strip().isdigit():
+                    # This looks like XYZ format
+                    if input_params is None:
+                        raise ValueError(f"XYZ file '{file_path}' requires input parameters. Please provide input_params.")
+                    
+                    mol = self._xyz_to_qcschema_mol(file_data)
+                    new_qcschema = self._new_qcshema(input_params, mol)
+                    qcshema_objects.append(new_qcschema)
+                    continue
+            except Exception as e:
+                # Not XYZ or error parsing XYZ
+                raise ValueError(f"Failed to parse file '{file_path}'. Error: {str(e)}")
+                
+            # If we get here, the file format wasn't recognized
+            raise ValueError(f"Unsupported file format for '{file_path}'. File must be XYZ or JSON format.")
 
         return qcshema_objects
 
